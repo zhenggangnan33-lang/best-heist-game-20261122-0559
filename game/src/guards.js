@@ -1,176 +1,152 @@
-// The guards and the cameras: how they walk their rounds, what their cones
-// catch, and how suspicion turns into a chase. Nothing here draws anything.
+// The guards and the cameras: how they move, how they look, and how fast
+// being seen turns into alarm. Nothing here draws or touches the browser.
+import { CAMERA_OFF_SECONDS, COINS, DETECT, GUARD } from './config.js';
+import { canSee, moveCircle, rugAt } from './world.js';
 
-import { ALARM, CAMERA, COIN, GUARD, LEVEL, THIEF } from './config.js';
-
-function angleTo(fromX, fromY, toX, toY) {
-  return Math.atan2(toY - fromY, toX - fromX);
-}
-
-function angleDiff(a, b) {
-  let d = a - b;
-  while (d > Math.PI) d -= Math.PI * 2;
-  while (d < -Math.PI) d += Math.PI * 2;
-  return d;
-}
-
-/** Smoothstep easing: 0 at the ends of a sweep, 1 in the middle. */
-function smoothstep(u) {
-  const t = Math.max(0, Math.min(1, u));
-  return t * t * (3 - 2 * t);
+/** Turn `angle` toward `target` by at most `rate * dt` radians. */
+function turnToward(angle, target, rate, dt) {
+  let diff = target - angle;
+  while (diff > Math.PI) diff -= Math.PI * 2;
+  while (diff < -Math.PI) diff += Math.PI * 2;
+  const step = rate * dt;
+  if (Math.abs(diff) <= step) return target;
+  return angle + Math.sign(diff) * step;
 }
 
 /**
- * A camera's sweep eased through smoothstep: it lingers at each end of its
- * arc and glides through the middle, so a careful thief can read the rhythm.
- * A pure function of time, so the game stays deterministic.
+ * One guard's step. Patrolling guards walk their loop and pause at each
+ * corner to look around; hunting guards run at the thief; an investigating
+ * guard walks to where a coin landed and looks it over before going back.
  */
-function cameraAngle(camera, time) {
-  const u = (Math.sin(time * 0.55 + camera.phase) + 1) / 2;
-  return camera.base + (smoothstep(u) * 2 - 1) * camera.sweep;
-}
-
-/** How exposed the thief is to one watcher: 0 is unseen, 1 is point blank. */
-export function exposure(watcherX, watcherY, watcherAngle, halfAngle, range, world, thief) {
-  const dx = thief.x - watcherX;
-  const dy = thief.y - watcherY;
-  const dist = Math.hypot(dx, dy);
-  if (dist > range) return 0;
-  if (Math.abs(angleDiff(Math.atan2(dy, dx), watcherAngle)) > halfAngle) return 0;
-  if (!world.lineOfSight(watcherX, watcherY, thief.x, thief.y)) return 0;
-  let seen = 1 - dist / range;
-  if (thief.sneaking) seen *= THIEF.sneakVisibility;
-  if (world.inShadow(thief.x, thief.y)) seen *= THIEF.shadowVisibility;
-  if (thief.moving) seen *= 1.12;
-  return Math.min(1, seen);
-}
-
-/**
- * Advance every guard and camera one step. Returns a bundle of what happened:
- * whether anyone can see the thief right now, and whether a guard caught him.
- */
-export function stepWatchers(world, dt) {
-  const state = world.state;
-  const thief = state.thief;
-  let anyoneSees = false;
-  let caughtBy = '';
-
-  for (const guard of state.guards) {
-    const seen = exposure(guard.x, guard.y, guard.angle, GUARD.viewHalfAngle, GUARD.viewRange, world, thief);
-    if (seen > 0) {
-      anyoneSees = true;
-      guard.suspicion = Math.min(1, guard.suspicion + seen * GUARD.spotRate * dt);
-      guard.lastSeenX = thief.x;
-      guard.lastSeenY = thief.y;
-      if (guard.suspicion > 0.25 && state.stats.spotted === 0) state.stats.spotted = 1;
-    } else {
-      guard.suspicion = Math.max(0, guard.suspicion - GUARD.calmRate * dt);
-    }
-    // A near miss: the guard was nearly sure (suspicion over 0.55) and the
-    // thief slipped away before a chase began. Counted once per scare.
-    guard.peak = Math.max(guard.peak || 0, guard.suspicion);
-    if (guard.state !== 'chase' && guard.peak > 0.55 && guard.suspicion < 0.2) {
-      state.stats.nearMiss += 1;
-      guard.peak = 0;
-    }
-    if (guard.state === 'chase') guard.peak = 0;
-
-    if (guard.state === 'patrol' && guard.suspicion >= GUARD.chaseAt) guard.state = 'chase';
-    if (guard.state === 'chase' && guard.suspicion <= GUARD.giveUpAt) guard.state = 'patrol';
-    if (guard.state === 'investigate') {
-      guard.studyLeft -= dt;
-      if (guard.studyLeft <= 0) guard.state = 'patrol';
-    }
-
-    const speed = guard.state === 'chase'
-      ? GUARD.chaseSpeed
-      : guard.state === 'investigate' ? GUARD.investigateSpeed : GUARD.patrolSpeed;
-
-    let targetX;
-    let targetY;
-    if (guard.state === 'chase' || (guard.state === 'investigate' && guard.suspicion > 0.4)) {
-      targetX = guard.lastSeenX;
-      targetY = guard.lastSeenY;
-    } else if (guard.state === 'investigate' && state.coin) {
-      targetX = state.coin.x;
-      targetY = state.coin.y;
-    } else {
-      const wp = LEVEL.guards[state.guards.indexOf(guard)].waypoints[guard.waypoint];
-      targetX = wp.x;
-      targetY = wp.y;
-    }
-
-    const dx = targetX - guard.x;
-    const dy = targetY - guard.y;
-    const dist = Math.hypot(dx, dy);
-    if (guard.state === 'patrol' && guard.waitLeft > 0) {
-      // Paused at a waypoint, the guard scans the room: a slow sweep across
-      // a 100-degree arc around the direction he arrived from, so standing
-      // still in front of a resting guard is never quite safe.
-      guard.waitLeft -= dt;
-      guard.arrivalAngle = guard.arrivalAngle ?? guard.angle;
-      guard.angle = guard.arrivalAngle + Math.sin(state.time * 1.4 + guard.seedPhase) * 0.55;
-    } else if (dist > 4) {
-      const step = Math.min(dist, speed * dt);
-      const nx = guard.x + (dx / dist) * step;
-      const ny = guard.y + (dy / dist) * step;
-      world.moveCircle(guard, nx - guard.x, ny - guard.y, GUARD.radius);
-      guard.angle = angleTo(guard.x, guard.y, targetX, targetY);
-      if (guard.state === 'patrol' && dist <= 6) {
-        guard.waypoint = (guard.waypoint + 1) % LEVEL.guards[state.guards.indexOf(guard)].waypoints.length;
-        // Corner waypoints get a longer look around than straight legs.
-        guard.waitLeft = 1.0 + (guard.waypoint % 2) * 0.8;
-        guard.arrivalAngle = guard.angle;
-      }
-    } else if (guard.state === 'investigate') {
-      guard.angle += 1.5 * dt;
-    }
-
-    const touch = Math.hypot(thief.x - guard.x, thief.y - guard.y);
-    if (touch < GUARD.radius + THIEF.radius - 2) caughtBy = guard.name;
+function stepGuard(guard, state, dt) {
+  const player = state.player;
+  if (state.alarm >= DETECT.huntAt && guard.mode !== 'hunt') {
+    guard.mode = 'hunt';
+  } else if (state.alarm < DETECT.calmAt && guard.mode === 'hunt') {
+    guard.mode = 'patrol';
   }
 
-  // The cameras sweep back and forth — eased, so they linger at each end of
-  // the arc — and a live one that holds the thief feeds the alarm.
+  if (guard.mode === 'hunt') {
+    const dx = player.x - guard.x;
+    const dy = player.y - guard.y;
+    const distance = Math.hypot(dx, dy);
+    if (distance > 1) {
+      const speed = GUARD.hunt * dt;
+      const moved = moveCircle(guard.x, guard.y, GUARD.radius, (dx / distance) * speed, (dy / distance) * speed);
+      guard.x = moved.x;
+      guard.y = moved.y;
+      guard.angle = turnToward(guard.angle, Math.atan2(dy, dx), 7, dt);
+    }
+    return;
+  }
+
+  if (guard.mode === 'investigate') {
+    const dx = guard.investigateX - guard.x;
+    const dy = guard.investigateY - guard.y;
+    const distance = Math.hypot(dx, dy);
+    if (distance > 8) {
+      const speed = GUARD.investigate * dt;
+      const moved = moveCircle(guard.x, guard.y, GUARD.radius, (dx / distance) * speed, (dy / distance) * speed);
+      guard.x = moved.x;
+      guard.y = moved.y;
+      guard.angle = turnToward(guard.angle, Math.atan2(dy, dx), 7, dt);
+      return;
+    }
+    guard.investigateWait -= dt;
+    guard.angle += Math.sin(state.time * 1.7 + guard.x) * 0.9 * dt;
+    if (guard.investigateWait <= 0) guard.mode = 'patrol';
+    return;
+  }
+
+  // Patrol.
+  if (guard.waiting > 0) {
+    guard.waiting -= dt;
+    guard.scan += dt;
+    guard.angle += Math.sin(guard.scan * 2.2) * 1.1 * dt;
+    return;
+  }
+  const target = guard.points[guard.leg];
+  const dx = target.x - guard.x;
+  const dy = target.y - guard.y;
+  const distance = Math.hypot(dx, dy);
+  if (distance < 6) {
+    guard.leg = (guard.leg + 1) % guard.points.length;
+    guard.waiting = GUARD.waitAtWaypoint;
+    guard.scan = 0;
+    return;
+  }
+  const speed = guard.speed * dt;
+  const moved = moveCircle(guard.x, guard.y, GUARD.radius, (dx / distance) * speed, (dy / distance) * speed);
+  guard.x = moved.x;
+  guard.y = moved.y;
+  guard.angle = turnToward(guard.angle, Math.atan2(dy, dx), 7, dt);
+}
+
+/** The cameras sweep back and forth until a hack switches them off. */
+function stepCameras(state, dt) {
   for (const camera of state.cameras) {
-    camera.angle = cameraAngle(camera, state.time);
-    if (state.camerasOffline > 0) continue;
-    const seen = exposure(camera.x, camera.y, camera.angle, CAMERA.halfAngle, CAMERA.range, world, thief);
-    if (seen > 0) {
-      anyoneSees = true;
-      state.alarm = Math.min(ALARM.max, state.alarm + seen * CAMERA.alarmRate * dt);
-    }
+    if (camera.disabled > 0) camera.disabled = Math.max(0, camera.disabled - dt);
+    camera.angle = camera.base + Math.sin((state.time * Math.PI * 2) / camera.period + camera.phase) * camera.sweep;
   }
-
-  // The alarm also climbs while any guard is sure of what he saw.
-  const hottest = Math.max(0, ...state.guards.map((g) => g.suspicion));
-  if (hottest > 0.55) {
-    state.alarm = Math.min(ALARM.max, state.alarm + (hottest - 0.55) * 46 * dt);
-  }
-  if (!anyoneSees && hottest <= 0.55) {
-    // The alarm cools on a curve: it sheds fast when it is only warm, and
-    // lingers when the whole museum is on edge — a loud run stays loud.
-    const decay = ALARM.decayPerSecond * (1.45 - 0.9 * (state.alarm / ALARM.max));
-    state.alarm = Math.max(0, state.alarm - decay * dt);
-  }
-  state.maxAlarm = Math.max(state.maxAlarm, state.alarm);
-
-  return { anyoneSees, caughtBy, hottest };
+  if (state.terminal.hacked > 0) state.terminal.hacked = Math.max(0, state.terminal.hacked - dt);
 }
 
-/** A coin toss pulls the nearest guards over to have a look. */
-export function lureGuards(world, x, y) {
-  const state = world.state;
-  let lured = 0;
+/** Move every guard and camera one step. */
+export function stepWatchers(state, dt) {
+  for (const guard of state.guards) stepGuard(guard, state, dt);
+  stepCameras(state, dt);
+}
+
+/**
+ * How fast the alarm is rising right now, and which watchers can see the
+ * thief. Sneaking and shadow rugs both slow it down; closeness speeds it up.
+ */
+export function computeDetection(state) {
+  const player = state.player;
+  const sneak = player.sneak ? DETECT.sneakFactor : 1;
+  const rug = rugAt(player.x, player.y) ? DETECT.rugFactor : 1;
+  let rate = 0;
+  const observers = [];
   for (const guard of state.guards) {
+    if (!canSee(guard.x, guard.y, guard.angle, DETECT.guardRange, DETECT.guardHalfAngle, player.x, player.y)) continue;
+    const distance = Math.hypot(player.x - guard.x, player.y - guard.y);
+    const proximity = Math.max(0.3, Math.min(1, 1.15 - distance / DETECT.guardRange));
+    rate += DETECT.guardRate * proximity * sneak * rug;
+    observers.push({ x: guard.x, y: guard.y, kind: 'guard' });
+  }
+  for (const camera of state.cameras) {
+    if (camera.disabled > 0) continue;
+    if (!canSee(camera.x, camera.y, camera.angle, DETECT.cameraRange, DETECT.cameraHalfAngle, player.x, player.y)) continue;
+    const distance = Math.hypot(player.x - camera.x, player.y - camera.y);
+    const proximity = Math.max(0.3, Math.min(1, 1.15 - distance / DETECT.cameraRange));
+    rate += DETECT.cameraRate * proximity * sneak * rug;
+    observers.push({ x: camera.x, y: camera.y, kind: 'camera' });
+  }
+  return { rate, observers };
+}
+
+/** Send the nearest patrolling guard to look at a coin that just landed. */
+export function sendInvestigator(state, x, y) {
+  let best = null;
+  let bestDistance = Infinity;
+  for (const guard of state.guards) {
+    if (guard.mode !== 'patrol') continue;
     const d = Math.hypot(guard.x - x, guard.y - y);
-    if (d < COIN.lureRadius && guard.state !== 'chase') {
-      guard.state = 'investigate';
-      guard.studyLeft = COIN.studySeconds;
-      guard.lastSeenX = x;
-      guard.lastSeenY = y;
-      lured += 1;
+    if (d < bestDistance) {
+      bestDistance = d;
+      best = guard;
     }
   }
-  return lured;
+  if (best === null || bestDistance > COINS.hearRadius) return false;
+  best.mode = 'investigate';
+  best.investigateX = x;
+  best.investigateY = y;
+  best.investigateWait = 2.5;
+  return true;
+}
+
+/** Switch the cameras off for a while after a successful hack. */
+export function disableCameras(state) {
+  for (const camera of state.cameras) camera.disabled = CAMERA_OFF_SECONDS;
+  state.terminal.hacked = CAMERA_OFF_SECONDS;
 }
